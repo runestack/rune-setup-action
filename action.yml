@@ -1,0 +1,108 @@
+name: 'Setup Rune CLI'
+description: 'Download and install the Rune CLI on the runner.'
+author: 'Runestack'
+branding:
+  icon: 'download-cloud'
+  color: 'purple'
+
+inputs:
+  version:
+    description: |
+      Rune CLI version to install (e.g. "v0.0.1-dev.26"). Use "latest" to
+      install the most recent release. The version must match a tag in
+      runestack/rune.
+    required: false
+    default: 'latest'
+  github-token:
+    description: |
+      GitHub token used for the "latest" version lookup and for
+      downloading the asset. Defaults to the workflow's GITHUB_TOKEN,
+      which is enough for public releases. Override only if you hit
+      rate limits or are pulling from a private fork.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  version:
+    description: 'The resolved Rune CLI version that was installed (e.g. v0.0.1-dev.26).'
+    value: ${{ steps.install.outputs.version }}
+  path:
+    description: 'Absolute path to the directory containing the rune binary (also added to PATH).'
+    value: ${{ steps.install.outputs.path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: install
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        # ── OS / arch detection ─────────────────────────────────────────
+        # Map runner os/arch onto the asset name pattern published by
+        # runestack/rune .github/workflows/release.yml:
+        #   rune-cli_<os>_<arch>.tar.gz
+        case "$(uname -s)" in
+          Linux)  os=linux ;;
+          Darwin) os=darwin ;;
+          *) echo "::error::Unsupported OS: $(uname -s). Rune publishes binaries for linux and darwin only." ; exit 1 ;;
+        esac
+        case "$(uname -m)" in
+          x86_64|amd64) arch=amd64 ;;
+          arm64|aarch64) arch=arm64 ;;
+          *) echo "::error::Unsupported arch: $(uname -m). Rune publishes binaries for amd64 and arm64 only." ; exit 1 ;;
+        esac
+
+        # ── Resolve "latest" → real tag ────────────────────────────────
+        # The GitHub "latest" endpoint excludes prereleases. While
+        # runestack/rune is in v0.0.x and every tag is a prerelease,
+        # fall back to the most recent tag from /releases when /latest
+        # 404s.
+        version="$INPUT_VERSION"
+        api_args=(-fsSL -H "Accept: application/vnd.github+json")
+        if [ -n "${INPUT_GITHUB_TOKEN:-}" ]; then
+          api_args+=(-H "Authorization: Bearer ${INPUT_GITHUB_TOKEN}")
+        fi
+        if [ "$version" = "latest" ]; then
+          if latest_json=$(curl "${api_args[@]}" https://api.github.com/repos/runestack/rune/releases/latest 2>/dev/null); then
+            version=$(printf '%s' "$latest_json" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+          fi
+          if [ -z "${version:-}" ] || [ "$version" = "latest" ]; then
+            # Fallback for prerelease-only repos: take the first entry
+            # from /releases.
+            version=$(curl "${api_args[@]}" 'https://api.github.com/repos/runestack/rune/releases?per_page=1' \
+              | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+          fi
+          if [ -z "${version:-}" ]; then
+            echo "::error::Could not resolve latest Rune release. Pin 'version:' explicitly."
+            exit 1
+          fi
+          echo "Resolved version: $version"
+        fi
+
+        # ── Cache hit? ─────────────────────────────────────────────────
+        # Each version goes into its own directory under tool-cache so
+        # repeated workflow runs (or matrix jobs) skip the download.
+        cache_root="${RUNNER_TOOL_CACHE:-$HOME/.cache/rune-setup}/rune/${version}/${os}_${arch}"
+        if [ ! -x "${cache_root}/rune" ]; then
+          mkdir -p "$cache_root"
+          asset="rune-cli_${os}_${arch}.tar.gz"
+          url="https://github.com/runestack/rune/releases/download/${version}/${asset}"
+          echo "Downloading $url"
+          tmp=$(mktemp -d)
+          curl "${api_args[@]}" -H "Accept: application/octet-stream" -o "${tmp}/${asset}" "$url"
+          tar -xzf "${tmp}/${asset}" -C "$cache_root"
+          rm -rf "$tmp"
+          chmod +x "${cache_root}/rune"
+        else
+          echo "Cache hit: ${cache_root}/rune"
+        fi
+
+        # ── Sanity check + expose ──────────────────────────────────────
+        "${cache_root}/rune" --version || true
+        echo "$cache_root" >> "$GITHUB_PATH"
+        echo "version=${version}" >> "$GITHUB_OUTPUT"
+        echo "path=${cache_root}" >> "$GITHUB_OUTPUT"
